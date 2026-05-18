@@ -1,12 +1,16 @@
-import os, logging, sqlite3, threading
-from flask import Flask
+import os
+import logging
+import asyncio
+from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-# CONFIG
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-PORT = int(os.getenv("PORT", 10000))
+# --- CONFIGURATION ---
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+PORT = int(os.environ.get("PORT", 10000))
+
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN not found in Environment Variables!")
 
 PLANS = {
     "starter": {"name": "Starter", "amt": 3000},
@@ -18,11 +22,11 @@ PLANS = {
     "vip": {"name": "VIP", "amt": 50000}
 }
 
-# DATABASE
+# --- DATABASE SETUP (SQLite) ---
+import sqlite3
 def get_db():
     conn = sqlite3.connect("nexavault.db", check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
     return conn
 
 def init_db():
@@ -36,29 +40,31 @@ def init_db():
 
 init_db()
 
-# BOT HANDLERS
+# --- BOT HANDLERS ---
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     c = get_db().cursor()
     c.execute("INSERT OR IGNORE INTO users(user_id, username, balance) VALUES(?,?,500)", (u.id, u.username))
     get_db().commit(); get_db().close()
+    
     kb = [[InlineKeyboardButton("💰 Wallet", callback_data="wallet")],
           [InlineKeyboardButton("📈 Invest", callback_data="invest")],
           [InlineKeyboardButton("💳 Deposit", callback_data="deposit")],
-          [InlineKeyboardButton(" Withdraw", callback_data="withdraw")]]
+          [InlineKeyboardButton("💸 Withdraw", callback_data="withdraw")]]
     await update.message.reply_text(f"👋 Welcome {u.first_name}! ₦500 bonus credited.", reply_markup=InlineKeyboardMarkup(kb))
 
 async def buttons(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
+    
     c = get_db().cursor()
     c.execute("SELECT balance FROM users WHERE user_id=?", (uid,))
     bal = c.fetchone()["balance"]
     get_db().close()
 
     if q.data == "wallet":
-        await q.edit_message_text(f"💰 *Balance*\n₦{bal:,.2f}", parse_mode="Markdown")
+        await q.edit_message_text(f"💰 *Balance*\n₦{bal:,.2f}", parse_mode='Markdown')
     elif q.data == "invest":
         kb = [[InlineKeyboardButton(f"{p['name']} ₦{p['amt']:,}", callback_data=f"i_{k}")] for k,p in PLANS.items()]
         await q.edit_message_text("📈 Choose Plan (25% daily profit):", reply_markup=InlineKeyboardMarkup(kb))
@@ -68,13 +74,13 @@ async def buttons(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             c = get_db().cursor()
             c.execute("UPDATE users SET balance=balance-? WHERE user_id=?", (plan["amt"], uid))
             get_db().commit(); get_db().close()
-            await q.edit_message_text(f"✅ Invested ₦{plan['amt']:,} in {plan['name']}!\nDaily Profit: ₦{plan['amt']*0.25:,.2f}")
+            await q.edit_message_text(f"✅ Invested {plan['amt']:,} in {plan['name']}!\nDaily Profit: ₦{plan['amt']*0.25:,.2f}")
         else:
             await q.edit_message_text(f"❌ Insufficient balance. Need ₦{plan['amt']:,}. You have ₦{bal:,.2f}")
     elif q.data == "deposit":
-        await q.edit_message_text("💳 *Deposit Instructions*\n\nBank: Opay\nName: Omotayo Anike Olumide\nAccount: `8037840735`\n\nAfter sending, type: `/confirm_deposit 5000`", parse_mode="Markdown")
+        await q.edit_message_text("💳 *Deposit Instructions*\n\nBank: Opay\nName: Omotayo Anike Olumide\nAccount: `8037840735`\n\nAfter sending, type: `/confirm_deposit 5000`", parse_mode='Markdown')
     elif q.data == "withdraw":
-        if bal < 500: await q.edit_message_text("❌ Minimum withdrawal is ₦500")
+        if bal < 500: await q.edit_message_text(" Minimum withdrawal is ₦500")
         else: await q.edit_message_text("💸 To withdraw, type: `/withdraw_request 1000 Opay 8037840735`")
 
 async def confirm_dep(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -88,7 +94,7 @@ async def confirm_dep(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except: await update.message.reply_text("❌ Usage: /confirm_deposit 5000")
 
 async def approve(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
+    if update.effective_user.id != 0: return # Change 0 to your Admin ID
     try:
         did = int(ctx.args[0])
         c = get_db().cursor()
@@ -101,21 +107,38 @@ async def approve(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"✅ Deposit #{did} approved.")
     except: await update.message.reply_text("❌ /approve <deposit_id>")
 
-# FLASK SERVER (Keeps Render alive & passes health checks)
-app = Flask(__name__)
-@app.route('/')
-def home():
-    return "NexaVault Bot is running ✅"
+# --- RENDER WEB SERVER (Keeps it alive) ---
+async def web_server():
+    web_app = web.Application()
+    # This route tells Render the app is healthy
+    web_app.router.add_get('/', lambda request: web.Response(text="NexaVault Bot is Running ✅"))
+    
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    print(f"🌐 Web server running on port {PORT}")
+    
+    # Keep server alive forever
+    while True:
+        await asyncio.sleep(3600)
 
-def run_bot():
+# --- MAIN EXECUTION ---
+async def main():
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("confirm_deposit", confirm_dep))
     application.add_handler(CommandHandler("approve", approve))
     application.add_handler(CallbackQueryHandler(buttons))
-    print("✅ Bot started successfully!")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    
+    print(" Bot starting...")
+    
+    # Run Bot and Web Server together
+    await asyncio.gather(
+        application.run_polling(drop_pending_updates=True),
+        web_server()
+    )
 
 if __name__ == "__main__":
-    threading.Thread(target=run_bot, daemon=True).start()
-    app.run(host="0.0.0.0", port=PORT)
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(main())
